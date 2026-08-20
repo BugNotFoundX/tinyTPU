@@ -1,6 +1,6 @@
 # minimind 模型架构
 
-![](../assets/LLM-structure.jpg)
+![MiniMind 模型架构](assets/LLM-structure.jpg)
 
 ## 1 逐层分析
 
