@@ -269,11 +269,12 @@ PS 通过 AXI-Lite 读写两组寄存器：
 一次 Tile 计算由 PS 按以下顺序调度：
 
 1. 配置 DMA，将 X 从 DDR 搬入 X Buffer，等待 `DMA_DONE`。
-2. 配置 DMA，将 W 从 DDR 搬入 Weight Buffer，等待 `DMA_DONE`。
-3. 配置并启动 GEMM，等待 `GEMM_DONE`，此时 O Buffer 中的结果有效。
-4. 配置 DMA，将 O Buffer 写回 DDR，等待 `DMA_DONE`。
+2. 配置并启动 W DMA，但不等待搬运全部完成。
+3. 启动 GEMM；W 通过 FIFO 持续流入 PE，GEMM 与 W DMA 并行执行。
+4. 等待 `GEMM_DONE` 和 W DMA 的 `DMA_DONE`，此时 O Buffer 中的结果有效。
+5. 配置 DMA，将 O Buffer 写回 DDR，等待 `DMA_DONE`。
 
-PL 不会自动发起下一次搬运或计算。GEMV 复用相同流程，只需设置 `VALID_ROWS=1`，此时 X Buffer 和 O Buffer 只有一行有效。
+X Tile 在进入列循环前加载一次，并被不同的 W 列 Tile 反复读取。PL 不会自动发起下一次搬运或计算。GEMV 复用相同流程，只需设置 `VALID_ROWS=1`，此时 X Buffer 和 O Buffer 只有一行有效。
 
 ### 4.2 GEMM 数据通路
 
@@ -285,36 +286,46 @@ $$
 
 16×16 阵列每次计算一个最多 16×16 的输出 Tile。PS 负责沿 M、N 维分块，PL GEMM CTRL 负责一次 Tile 内 K 维的乘加、流水线排空和结果写入 O Buffer。
 
-1. DMA 加载最多16行 X 到 X Row Buffer。
-2. DMA 加载当前输出 Tile 对应的权重到 Weight Buffer。
-3. GEMM CTRL 连续执行 K 次乘加。
+1. DMA 加载最多16行 X 到 X Row Buffer，X 在多个列 Tile 间复用。
+2. W DMA 按每16列启动流式传输，将权重写入 Weight FIFO。
+3. GEMM CTRL 从 X Buffer 读取 X，同时从 Weight FIFO 消费 W，连续执行 K 次乘加。
 4. 有效结果写入 O Buffer。
 5. PS 启动 DMA，将有效结果写回 DDR。
+
+Weight FIFO 使用 `valid/ready` 与 GEMM CTRL 握手。FIFO 为空时，GEMM 必须暂停 X 读取和 K 计数；FIFO 中出现数据后再继续，保证同一个 K 下标的 X、W 同拍进入阵列。
 
 | 操作 | 源 | 目标 | 说明 |
 | ---- | -- | ---- | ---- |
 | `dma_ddr_to_x` | DDR | X Row Buffer | PS 配置、启动并等待完成 |
-| `dma_ddr_to_w` | DDR | Weight Buffer | PS 配置、启动并等待完成 |
-| `gemm_tile` | X/Weight Buffer | O Buffer | 计算一个最多16×16的 Tile |
+| `dma_ddr_to_w` | DDR | Weight FIFO | 非阻塞启动，与 GEMM 流水执行 |
+| `gemm_tile` | X Buffer/Weight FIFO | O Buffer | 消费流式 W，计算一个最多16×16的 Tile |
 | `dma_o_to_ddr` | O Buffer | DDR | PS 配置、启动并等待完成 |
 
 ```python
-def gemm(X_addr, W_addr, O_addr, M, K, N):
+def gemm(X_addr, W_addr, O_addr, M, K, N):  # PS 调用这个函数
+    # 沿 X/O 的行方向循环，每次最多计算16行
     for row_base in range(0, M, 16):
         valid_rows = min(16, M - row_base)
 
+        # 加载当前最多16行的 X；同一个行 Tile 中，X Row 只需要取一次
         dma_ddr_to_x(X_addr, row_base, valid_rows)
         wait_dma_done()
 
+        # 沿 W/O 的列方向循环，每次最多计算16列
         for col_base in range(0, N, 16):
             valid_cols = min(16, N - col_base)
 
+            # 非阻塞启动 W DMA；权重按每16列持续流入 Weight FIFO
             dma_ddr_to_w(W_addr, col_base, valid_cols)
-            wait_dma_done()
 
+            # GEMM 与 W DMA 并行；FIFO 为空时 GEMM 暂停，X 留在 Buffer 中复用
             gemm_tile(K, valid_rows, valid_cols)
             wait_gemm_done()
 
+            # 确认本次 W DMA 已结束，才能复用 DMA 执行 O Buffer 写回
+            wait_dma_done()
+
+            # 等当前 Tile 写入 O Buffer 后，由 PS 启动 DMA 写回 DDR
             dma_out_to_ddr(O_addr, row_base, col_base,
                            valid_rows, valid_cols)
             wait_dma_done()
@@ -325,10 +336,10 @@ def gemm(X_addr, W_addr, O_addr, M, K, N):
     - width：16×8
 - **Output Row Buffer**：304kb
     - depth：2432
-    - width：16×8
+    - width：16×32
 - **Weight Buffer**：FIFO
     - depth：2432
-    - width：16×32
+    - width：16×8
 
 ## 5 当前存在的问题
 
