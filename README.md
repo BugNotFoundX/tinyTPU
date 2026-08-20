@@ -254,6 +254,7 @@ flowchart BT
 ## 4 架构
 
 ![tinyTPU 架构图](assets/architecture.jpg)
+
 $$
 O=XW
 $$
